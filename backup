@@ -1,0 +1,395 @@
+#!/usr/bin/env python
+
+import math, os, socket, time, subprocess, datetime, sys, getpass, getopt, yaml
+import boto, boto.s3.connection
+from boto.s3.lifecycle import Lifecycle, Expiration
+import hashlib
+import smtplib
+from filechunkio import FileChunkIO
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import mysql.connector
+
+config = {}
+
+def main(argv):
+
+	# boolean whether we should back the database up
+	backup_database = True
+
+	try:                                
+		opts, args = getopt.getopt(argv, "hin", ["help", "init", "no-db"])
+	except getopt.GetoptError:
+		usage()
+		sys.exit(2)
+
+	for opt, arg in opts:
+		if opt in ('-h', '--help'):
+			usage()
+			sys.exit()
+		elif opt in ('-i', '--init'):
+			new_config()
+		if opt in ('-n', '--no-db'):
+			backup_database = False
+
+	check_config(backup_database)
+	if load_config():
+		global config
+		config = load_config()
+	
+	# connect to s3
+	conn = connect()
+	if not conn:
+		log('Could not connect to S3')
+		sys.exit()
+
+	# generate the folder structure for today's backups
+	filename = generate_backup_filename()
+
+	if backup_database:
+		# dump the database into database.sql, compress it and upload it
+		if(dump_database(filename)):
+			upload_backup(conn, filename+'/database.sql.gz')
+		else:
+			# if it fails, send an email
+			log('Database backup failed at '+time.strftime('%H:%M:%S %d/%m/%Y'))
+	else:
+		log('Database not backed up because the user requested it')
+
+	# get all of the SSL certificates, keys and CSRs, compress it and upload it
+	if(archive_ssl(filename)):
+		upload_backup(conn, filename+'/ssl.tar.gz')
+	else:
+		# if it doesn't work, send an email
+		log('SSL backup failed at '+time.strftime('%H:%M:%S %d/%m/%Y'))
+
+	if archive_folder('/etc/nginx', filename, 'nginx.tar.gz'):
+		upload_backup(conn, filename+'/nginx.tar.gz')
+	else:
+		log('Nginx backup failed at '+time.strftime('%H:%M:%S %d/%m/%Y'))
+
+	if archive_folder('/etc/httpd', filename, 'httpd.tar.gz'):
+		upload_backup(conn, filename+'/httpd.tar.gz')
+	else:
+		log('HTTPd backup failed at '+time.strftime('%H:%M:%S %d/%m/%Y'))
+
+	if archive_folder('/etc/fail2ban', filename, 'fail2ban.tar.gz'):
+		upload_backup(conn, filename+'/fail2ban.tar.gz')
+	else:
+		log('Fail2ban backup failed at '+time.strftime('%H:%M:%S %d/%m/%Y'))
+
+	if archive_folder('/etc/postfix', filename, 'postfix.tar.gz'):
+		upload_backup(conn, filename+'/postfix.tar.gz')
+	else:
+		log('Postfix backup failed at '+time.strftime('%H:%M:%S %d/%m/%Y'))
+
+	if archive_folder('/etc/dovecot', filename, 'dovecot.tar.gz'):
+		upload_backup(conn, filename+'/dovecot.tar.gz')
+	else:
+		log('Dovecot backup failed at '+time.strftime('%H:%M:%S %d/%m/%Y'))
+
+	upload_backup(conn, filename+'/checksum')
+	set_backup_expiry(conn, filename)
+	cleanup()
+
+def new_config():
+	config_path = '/etc/backup/'
+	config_file = 'backup.yml'
+
+	config = {'s3' : {'access_key' : '', 'secret' : ''}, 'mysql' : { 'user' : '', 'password' : '' }	}
+	config = store_s3_credentials(config)
+	config = store_mysql_credentials(config)	
+
+
+	save_config(config)
+	if os.path.exists(config_path+config_file):
+		log('Saved new configuration file')
+		with open (config_path+config_file) as f:
+			config = yaml.load(f)
+	else:
+		log('Error writing to configuration file')
+		sys.exit('Error writing to configuration file')
+	print 'New configuration saved'
+	sys.exit()
+
+def check_config(backup_database):
+	config_path = '/etc/backup/'
+	config_file = 'backup.yml'
+	
+	if os.path.exists(config_path+config_file):
+		with open (config_path+config_file) as f:
+			config = yaml.load(f)
+	else:
+		config = {'s3' : {'access_key' : '', 'secret' : ''}, 'mysql' : { 'user' : '', 'password' : '' }	}
+		print 'No S3 Credentials found.'
+		config = store_s3_credentials(config)
+		if backup_database:
+			print 'No MySQL credentials found.'
+			config = store_mysql_credentials(config)
+		save_config(config)
+		if os.path.exists(config_path+config_file):
+			log('Saved new configuration file')
+			with open (config_path+config_file) as f:
+				config = yaml.load(f)
+		else:
+			log('Error writing to configuration file')
+			sys.exit('Error writing to configuration file')
+	return config
+
+def load_config():
+	config_path = '/etc/backup/'
+	config_file = 'backup.yml'
+
+	if os.path.exists(config_path+config_file):
+		with open (config_path+config_file) as f:
+			config = yaml.load(f)
+	else: 
+		return False
+	return config
+
+def save_config(config):
+	config_path = '/etc/backup/'
+	config_file = 'backup.yml'
+	if not os.path.exists(config_path):
+		os.makedirs(config_path)
+	with open(config_path+config_file, 'w') as outfile:
+		outfile.write( yaml.dump(config, default_flow_style=False) )
+		os.chmod(config_path, 0700)
+		os.chmod(config_path+config_file, 0600)
+	
+def usage():
+	print 'Usage: backup [OPTION...]'
+	print '\t -h, --help \t\t\t give this help list'
+	print '\t -i, --init \t\t\t force overwriting of S3 and MySQL Credentials'
+	print '\t -n, --no-db \t\t\t don\'t backup the database\n'
+
+	print 'Mandatory or optional arguments to long options are also mandatory or optional\nfor any corresponding short options.\n'
+
+	print 'Report bugs to alex@asdfx.us'
+
+def test_s3_credentials(access_key, secret):
+	conn = boto.connect_s3(
+		aws_access_key_id = access_key,
+		aws_secret_access_key = secret,
+		host = 'vault.my-host.co.uk',
+		is_secure=True,
+		calling_format = boto.s3.connection.OrdinaryCallingFormat(),
+	)
+	try:
+		bucket = conn.get_bucket('my-bucket')
+	except boto.exception.S3ResponseError as err:
+		return False
+	return True
+
+def store_s3_credentials(config):
+	access_key = getpass.getpass('Please enter your S3 access key id:\n')
+	secret = getpass.getpass('Please enter your S3 secret:\n')
+	while not(test_s3_credentials(access_key, secret)):
+		print 'Incorrect credentials entered. Please try again.'
+		access_key = getpass.getpass('Please enter your S3 access key id:\n')
+		secret = getpass.getpass('Please enter your S3 secret:\n')
+	config['s3']['access_key'] = access_key
+	config['s3']['secret'] = secret
+	return config
+
+def store_mysql_credentials(config):
+	user = getpass.getpass('Please enter your MySQL username that has privileges to dump all databases: \n')
+	# get the mysql credentials from the user
+	password = getpass.getpass('Please enter your root MySQL password: \n')
+	# test the mysql credentials
+	while not(test_mysql_credentials(user, password)):
+		print 'Incorrect credentials entered. Please try again.'
+		user = getpass.getpass('Please enter your MySQL username that has privileges to dump all databases: \n')
+		password = getpass.getpass('Please enter your root MySQL password: \n')
+	config['mysql']['user'] = user
+	config['mysql']['password'] = password
+	return config
+
+def test_mysql_credentials(u, p):
+	try:
+		cnx = mysql.connector.connect(user=u, password=p, host='localhost', database='mysql')
+	except mysql.connector.Error as err:
+		return False
+	return True
+
+#connect to S3
+def connect():
+	global config
+	
+	access_key = config['s3']['access_key']
+	secret =  config['s3']['secret']
+
+	try:
+		conn = boto.connect_s3(
+			host = 'vault.my-host.co.uk',
+			aws_access_key_id = access_key,
+			aws_secret_access_key = secret,
+			is_secure=True,
+			calling_format = boto.s3.connection.OrdinaryCallingFormat()
+		)
+		return conn
+	except:
+		log('Failed to connect to S3')
+		return False
+
+#generate the file structure for today's backup
+def generate_backup_filename():
+	# file structure should be HOSTNAME/YEAR/MONTH/DAY
+	hostname = socket.gethostname()
+	date_time = time.strftime("%Y/%m/%d")
+
+	dest_path = hostname + '/' + date_time 
+	# if the folder doesn't exist...
+	if os.path.exists(dest_path):
+		command = 'rm -rf '+dest_path
+		process = subprocess.Popen(command, shell=True)
+		process.communicate()
+		# make the folder(s)!
+		os.makedirs(dest_path)
+	else:
+		# make the folder(s)!
+		os.makedirs(dest_path)
+
+	return dest_path
+
+def archive_ssl(filename):
+	# find all files that end in csr/crt/key within the /var/www/*/ssl/ and copy them to the backup directory
+	command = 'find /var/www/*/ssl/ -regex ".*\.\(csr\|crt\|key\)$" -exec cp --parents \{\} '+filename+' \;'
+	process = subprocess.Popen(command, shell=True)
+	process.communicate()
+
+	# if the find found the files and copied them, then compress them
+	if(process.returncode==0):
+		command = 'tar -zcf /tmp/backup.tar.gz '+filename+' --exclude=\'database.sql.gz\' && mv /tmp/backup.tar.gz '+filename+'/ssl.tar.gz'
+		process = subprocess.Popen(command, shell=True)
+		process.communicate()
+		command = 'rm -rf '+filename+'/var'
+		process = subprocess.Popen(command, shell=True)
+		process.communicate()
+	else:
+		log('Failed to find SSL certificates')
+		return False
+
+	if(process.returncode==0):
+		#generate md5sum and add to checksum file
+		hashfile(filename, '/ssl.tar.gz')
+		return True
+	else:
+		log('Failed to create SSL tarball')
+		return False
+
+def archive_folder(folder, backup_folder, backup_filename):
+	#tarball the nginx config
+	command = 'tar -zcf /tmp/'+backup_filename+' '+folder+' && mv /tmp/'+backup_filename+' '+backup_folder+'/'+backup_filename
+	process = subprocess.Popen(command, shell=True)
+	process.communicate()
+
+	if(process.returncode==0):
+		#generate md5sum and add to checksum file
+		hashfile(backup_folder, '/'+backup_filename)
+		return True
+	else:
+		log('Failed to create tarball of '+folder)
+		return False
+
+def dump_database(filename):
+	global config
+	# dump all of the databases to a SQL file
+	user = config['mysql']['user']
+	password = config['mysql']['password']
+	if(password != ""):
+		password = '-p'+password
+	process = subprocess.Popen('mysqldump -u'+user+' '+password+' --all-databases > '+str(filename+'/database.sql'), shell=True)
+	process.communicate()
+	# if the database dump was successful
+	if(process.returncode==0):
+		# gzip the SQL file 
+		process = subprocess.Popen('gzip -9 '+str(filename+'/database.sql'), shell=True)
+		process.communicate()
+		if(process.returncode==0):
+			#generate md5sum and add to checksum file
+			hashfile(filename, '/database.sql.gz')
+			return True
+		else:
+			log('Failed to gzip database')
+			return False
+	else:
+		log('Failed to dump database')
+		return False
+
+def hashfile(filePath, filename):
+	with open(filePath+filename, 'rb') as fh:
+		m = hashlib.md5()
+		while True:
+			data = fh.read(8192)
+			if not data:
+				break
+			m.update(data)
+		checksum = m.hexdigest()
+	  #store the checksum
+		f = open(filePath+'/checksum', 'a+')
+		f.write(filename+' '+checksum+'\n')
+		f.close()
+
+def upload_backup(conn, filename):
+
+	# this is the file we are uploading
+	source_path = filename
+	# filesize of the file
+	source_size = os.stat(source_path).st_size
+
+	try:
+		# the bucket we are uploading to
+		bucket = conn.get_bucket('my-bucket')
+
+		mp = bucket.initiate_multipart_upload(filename, None, False, None, True)
+
+		# upload in 50MB chunks
+		chunk_size = 52428800
+		#work out how many chunks we have
+		chunk_count = int(math.ceil(source_size / chunk_size))
+
+		# for each chunk
+		for i in range(chunk_count + 1):
+			offset = chunk_size * i
+			bytes = min(chunk_size, source_size - offset)
+			# upload the chunk as a multipart upload
+			with FileChunkIO(source_path, 'r', offset=offset,bytes=bytes) as fp:
+				mp.upload_part_from_file(fp, part_num=i + 1)
+
+		# when we're done, tell S3 we're finished!
+		mp.complete_upload()
+	except:
+		log('Failed to upload '+filename+' to S3')
+
+def log(text, level='info'):
+	import logging
+	logging.basicConfig(filename='/var/log/backup/backup.log', filemode='a+', level=logging.INFO, format='%(asctime)s %(message)s', datefmt='%m/%d/%Y %I:%M:%S %p')
+	if(level=='info'):
+		logging.info(text)
+	elif(level=='warning'):
+		logging.warning(text)
+
+# expiry the backup 
+def set_backup_expiry(conn, directory):
+	bucket = conn.get_bucket('my-bucket')
+
+	lifecycle = Lifecycle()
+	# set the directory we just created to expire after 30 days
+	lifecycle.add_rule('backupExpiry', prefix=directory, status='Enabled', expiration=Expiration(days=30))
+	bucket = conn.get_bucket('my-bucket')
+	try:
+		bucket.configure_lifecycle(lifecycle)
+	except:
+		log('Failed to set backup expiry for '+directory)
+
+#clean up the backups
+def cleanup():
+	hostname = socket.gethostname()
+	command = 'rm -rf '+hostname
+	# delete the local backup to save disk space
+	process = subprocess.Popen(command, shell=True)
+	process.communicate()
+
+if __name__ == '__main__':
+	main(sys.argv[1:])

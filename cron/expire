@@ -1,0 +1,5 @@
+#!/bin/sh
+
+/usr/bin/expire -y >/dev/null 2>&1
+exit 0
+

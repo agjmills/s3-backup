@@ -1,0 +1,155 @@
+#!/usr/bin/env python
+
+import math, os, socket, time, subprocess, datetime, sys, getpass, getopt
+import boto, boto.s3.connection
+from boto.s3.lifecycle import Lifecycle, Expiration
+import hashlib
+import smtplib
+from filechunkio import FileChunkIO
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import mysql.connector
+
+def main(argv):
+
+        try:                                
+                opts, args = getopt.getopt(argv, "hif:", ["help", "init", "file="])
+        except getopt.GetoptError:
+                usage()
+                sys.exit(2)
+
+        for opt, arg in opts:
+                if opt in ('-h', '--help'):
+                        usage()
+                        sys.exit()
+                elif opt in ('-i', '--init'):
+                        store_s3_credentials()
+                        store_mysql_credentials()
+                        print 'Credentials stored'
+                        sys.exit()
+                elif opt in ('-o', '--file'):
+                        # check we have aws credentials stored somwehre
+                        if not (check_for_aws_credentials()):
+                                print 'No S3 Credentials found.'
+                                store_s3_credentials()
+
+                        # connect to s3
+                        conn = connect()
+                        if not conn:
+                                log('Could not connect to S3')
+                                sys.exit()
+
+                        upload_backup(conn, arg)
+                        get_url(conn, arg)
+
+
+def get_url(conn, filename):
+        bucket = conn.get_bucket('upload')
+        keys = bucket.list(prefix=filename)
+        for key in keys:
+                print key.generate_url(expires_in=86400)
+
+
+def usage():
+        print 'Usage: upload [OPTION...]'
+        print '\t -h, --help \t\t\t give this help list'
+        print '\t -i, --init \t\t\t force overwriting of S3 and MysQL Credentials\n'
+        print '\t -f [filename], --file=[filename] \t\t\t the file that should be uploaded\n'
+
+        print 'Mandatory or optional arguments to long options are also mandatory or optional\nfor any corresponding short options.\n'
+
+        print 'Report bugs to alex@asdfx.us'
+
+def test_s3_credentials(access_key, secret):
+        conn = boto.connect_s3(
+                aws_access_key_id = access_key,
+                aws_secret_access_key = secret,
+                host = 'vault.my-host.co.uk',
+                is_secure=True,
+                calling_format = boto.s3.connection.OrdinaryCallingFormat(),
+        )
+        try:
+                bucket = conn.get_bucket('my-bucket')
+        except boto.exception.S3ResponseError as err:
+                return False
+        return True
+
+def store_s3_credentials():
+        access_key = getpass.getpass('Please enter your S3 access key id:\n')
+        secret = getpass.getpass('Please enter your S3 secret:\n')
+        while not(test_s3_credentials(access_key, secret)):
+                print 'Incorrect credentials entered. Please try again.'
+                access_key = getpass.getpass('Please enter your S3 access key id:\n')
+                secret = getpass.getpass('Please enter your S3 secret:\n')
+        home = os.path.expanduser("~")
+        filename = home+'/.boto'
+        if not os.path.exists(os.path.dirname(filename)):
+                os.makedirs(os.path.dirname(filename))
+        f = open(home+'/.boto', 'w+')
+        f.truncate()
+        f.write('[Credentials]\n')
+        f.write('aws_access_key_id = '+access_key+'\n')
+        f.write('aws_secret_access_key = '+secret+'\n')
+        f.close()
+
+def check_for_aws_credentials():
+        home = os.path.expanduser("~")
+        if(os.path.isfile(home+'/.boto')):
+                return True
+        return False
+
+#connect to S3
+def connect():
+
+        try:
+                conn = boto.connect_s3(
+                        host = 'vault.my-host.co.uk',
+                        is_secure=True,
+                        calling_format = boto.s3.connection.OrdinaryCallingFormat()
+                )
+                return conn
+        except:
+                log('Failed to connect to S3')
+                return False
+
+def upload_backup(conn, filename):
+
+        # this is the file we are uploading
+        source_path = filename
+        # filesize of the file
+        source_size = os.stat(source_path).st_size
+
+        try:
+                # the bucket we are uploading to
+                bucket = conn.get_bucket('upload')
+
+                mp = bucket.initiate_multipart_upload(filename, None, False, None, True)
+
+                # upload in 50MB chunks
+                chunk_size = 52428800
+                #work out how many chunks we have
+                chunk_count = int(math.ceil(source_size / chunk_size))
+
+                # for each chunk
+                for i in range(chunk_count + 1):
+                        offset = chunk_size * i
+                        bytes = min(chunk_size, source_size - offset)
+                        # upload the chunk as a multipart upload
+                        with FileChunkIO(source_path, 'r', offset=offset,bytes=bytes) as fp:
+                                mp.upload_part_from_file(fp, part_num=i + 1)
+
+                # when we're done, tell S3 we're finished!
+                mp.complete_upload()
+        except:
+                log('Failed to upload '+filename+' to S3')
+
+def log(text, level='info'):
+        import logging
+        logging.basicConfig(filename='./backup.log', filemode='a+', level=logging.INFO, format='%(asctime)s %(message)s', datefmt='%m/%d/%Y %I:%M:%S %p')
+        if(level=='info'):
+                logging.info(text)
+        elif(level=='warning'):
+                logging.warning(text)
+
+if __name__ == '__main__':
+        main(sys.argv[1:])

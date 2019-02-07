@@ -1,0 +1,178 @@
+#!/usr/bin/env python
+
+import math, os, socket, time, subprocess, datetime, sys, getpass, getopt, yaml
+import boto, boto.s3.connection
+from boto.s3.lifecycle import Lifecycle, Expiration
+import hashlib
+import smtplib
+from filechunkio import FileChunkIO
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import mysql.connector
+
+config = {}
+automatic = False
+
+def main(argv):
+
+	try:                                
+		opts, args = getopt.getopt(argv, "hiy", ["help", "init", "yes"])
+	except getopt.GetoptError:
+		usage()
+		sys.exit(2)
+
+
+	for opt, arg in opts:
+		if opt in ('-y', '--yes'):
+			global automatic
+			automatic = True
+		if opt in ('-h', '--help'):
+			usage()
+			sys.exit()
+		elif opt in ('-i', '--init'):
+			new_config()
+
+	check_config()
+	if load_config():
+		global config
+		config = load_config()
+		
+	# connect to s3
+	conn = connect()
+	if not conn:
+		log('Could not connect to S3')
+		sys.exit()
+
+	list_expired_keys(conn)
+
+def load_config():
+	config_path = '/etc/backup/'
+	config_file = 'backup.yml'
+
+	if os.path.exists(config_path+config_file):
+		with open (config_path+config_file) as f:
+			config = yaml.load(f)
+	else:
+		return False
+	return config
+
+def check_config():
+	config_path = '/etc/backup/'
+	config_file = 'backup.yml'
+
+	if os.path.exists(config_path+config_file):
+		with open (config_path+config_file) as f:
+			config = yaml.load(f)
+	else:
+		config = {'s3' : {'access_key' : '', 'secret' : ''}, 'mysql' : { 'user' : '', 'password' : '' } }
+		log('No S3 Credentials')
+		sys.exit('No S3 Credentials found therefore cannot continue.')
+	return config
+
+
+
+def list_expired_keys(conn):
+	bucket = conn.get_bucket('my-bucket')
+	rs = bucket.list()
+	folders = []
+	for key in rs:
+		folders.append(key.name.rsplit('/',1)[0])
+		
+	folders = list(set(folders))
+	folders.sort()
+
+	expired_folders = []
+
+	now = datetime.datetime.now()
+	two_weeks_ago = time.mktime( (now - datetime.timedelta(days=14)).timetuple() )
+	for folder in folders:
+		tmp = folder.split('/',1)
+		if len(tmp) < 2:
+			continue
+		date = (time.mktime(time.strptime(tmp[1], "%Y/%m/%d")))
+		if date < two_weeks_ago:
+			expired_folders.append(folder)
+	if len(expired_folders) > 0:
+		global automatic
+		if not automatic:
+			delete = query_yes_no('Do you want to delete these backups permanently? (cannot be undone)')
+			if(delete):
+				delete_backups(conn, expired_folders)
+			else:
+				log('Nothing was deleted')
+		else:
+			delete_backups(conn, expired_folders)
+	else:
+		log('No expired folders exist in S3')
+	
+def delete_backups(conn, expired_folders):
+	bucket = conn.get_bucket('my-bucket')
+	for folder in expired_folders:
+		log('Deleting '+folder)
+		rs = bucket.list(folder)
+		for key in rs:
+			log('Deleted '+key.name)
+			key.delete()
+
+def usage():
+	print 'Usage: backup [OPTION...]'
+	print '\t -h, --help \t\t\t give this help list'
+	print '\t -i, --init \t\t\t force overwriting of S3 and MysQL Credentials\n'
+
+	print 'Mandatory or optional arguments to long options are also mandatory or optional\nfor any corresponding short options.\n'
+
+	print 'Report bugs to alex@asdfx.us'
+
+#connect to S3
+def connect():
+	global config
+	
+	access_key = config['s3']['access_key']
+	secret = config['s3']['secret']
+
+	try:
+		conn = boto.connect_s3(
+			host = 'vault.my-host.co.uk',
+			aws_access_key_id = access_key,
+			aws_secret_access_key = secret,
+			is_secure=True,
+			calling_format = boto.s3.connection.OrdinaryCallingFormat()
+		)
+		return conn
+	except:
+		log('Failed to connect to S3')
+		return False
+
+def log(text, level='info'):
+	import logging
+	logging.basicConfig(filename='/var/log/backup/expire.log', filemode='a+', level=logging.INFO, format='%(asctime)s %(message)s', datefmt='%m/%d/%Y %I:%M:%S %p')
+	if(level=='info'):
+		logging.info(text)
+	elif(level=='warning'):
+		logging.warning(text)
+
+def query_yes_no(question, default="no"):
+	valid = {"yes": True, "y": True, "ye": True, "no": False, "n": False}
+	if default is None:
+		prompt = " [y/n] "
+	elif default == "yes":
+		prompt = " [Y/n] "
+	elif default == "no":
+		prompt = " [y/N] "
+	else:
+		raise ValueError("invalid default answer: '%s'" % default)
+	
+	while True:
+		sys.stdout.write(question + prompt)
+		choice = raw_input().lower()
+		if default is not None and choice == '':
+			return valid[default]
+		elif choice in valid:
+			return valid[choice]
+		else:
+			sys.stdout.write("Please respond with 'yes' or 'no' (or 'y' or 'n').\n")
+
+
+if __name__ == '__main__':
+	main(sys.argv[1:])
+
